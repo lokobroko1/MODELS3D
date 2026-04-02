@@ -10,7 +10,7 @@ Dependencies:
     pip install pillow imageio imageio-ffmpeg scipy tqdm numpy
 
 Usage:
-    python size_comparison_fast.py
+    python size_comparison_3d.py
 
 Output: size_comparison_3d.mp4
 """
@@ -26,6 +26,8 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import imageio
 from tqdm import tqdm
 from scipy.ndimage import gaussian_filter
+from scipy.spatial import cKDTree
+from scipy.interpolate import RegularGridInterpolator
 
 # ---------------------------------------------------------------------------
 # Section 2: CONFIGURATION
@@ -43,6 +45,12 @@ assert FPS_OUTPUT % FPS_RENDER == 0
 _FRAME_REPEAT = FPS_OUTPUT // FPS_RENDER  # 3x duplication
 
 BG_COLOR = (4, 3, 18)
+
+# Directory where this script lives (used to find .obj files)
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Cache for OBJ-based SDF functions (keyed by object index)
+_OBJ_SDF_CACHE = {}
 
 # Shorter timings per object for ~3min total with 18 objects
 SEC_APPEAR = 1.0
@@ -104,6 +112,7 @@ OBJECTS = [
         ],
         'si_label': '1.2 × 10⁻¹⁰ m  (0.12 nm)',
         'us_label': '4.7 × 10⁻⁹ inches',
+        'obj_file': 'atom.obj',
     },
     {
         'name': 'DNA Molecule',
@@ -118,6 +127,7 @@ OBJECTS = [
         ],
         'si_label': '2.5 × 10⁻⁹ m  (2.5 nm)',
         'us_label': '9.8 × 10⁻⁸ inches',
+        'obj_file': 'DNA.obj',
     },
     {
         'name': 'SARS-CoV-2 Virus',
@@ -132,6 +142,7 @@ OBJECTS = [
         ],
         'si_label': '1.2 × 10⁻⁷ m  (120 nm)',
         'us_label': '4.7 × 10⁻⁶ inches',
+        'obj_file': 'Coronavirus.obj',
     },
     {
         'name': 'Red Blood Cell',
@@ -146,6 +157,7 @@ OBJECTS = [
         ],
         'si_label': '8 × 10⁻⁶ m  (8 micrometers)',
         'us_label': '3.1 × 10⁻⁴ inches',
+        'obj_file': 'erythro_for_obj.obj',
     },
     {
         'name': 'Ant',
@@ -160,6 +172,7 @@ OBJECTS = [
         ],
         'si_label': '2 × 10⁻³ m  (2 mm)',
         'us_label': '0.08 inches',
+        'obj_file': 'ant.obj',
     },
     {
         'name': 'Human',
@@ -174,6 +187,7 @@ OBJECTS = [
         ],
         'si_label': '1.75 m',
         'us_label': '5 ft 9 in  (69 inches)',
+        'obj_file': 'obj file.obj',
     },
     {
         'name': 'Eiffel Tower',
@@ -188,6 +202,7 @@ OBJECTS = [
         ],
         'si_label': '324 m',
         'us_label': '1,063 feet  (0.2 miles)',
+        'obj_file': 'eiffel_tower.obj',
     },
     {
         'name': 'Mount Everest',
@@ -216,6 +231,7 @@ OBJECTS = [
         ],
         'si_label': '12,742 km',
         'us_label': '7,918 miles',
+        'obj_file': 'earth obj.obj',
     },
     {
         'name': 'Jupiter',
@@ -764,6 +780,178 @@ def sdf_observable_universe(p, t):
     return d
 
 # ---------------------------------------------------------------------------
+# Section 7b: OBJ LOADER & MESH-TO-SDF
+# ---------------------------------------------------------------------------
+
+def load_obj(filepath):
+    """Parse a Wavefront .OBJ file.
+
+    Returns ``(vertices, faces)`` as float32 / int32 numpy arrays, with the
+    mesh normalised so it fits inside the [-0.9, 0.9]³ cube centred at the
+    origin.  Returns ``(None, None)`` on any failure.
+    """
+    vertices = []
+    faces = []
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as fh:
+            for line in fh:
+                parts = line.split()
+                if not parts:
+                    continue
+                if parts[0] == 'v':
+                    try:
+                        vertices.append([float(parts[1]), float(parts[2]),
+                                         float(parts[3])])
+                    except (IndexError, ValueError):
+                        pass
+                elif parts[0] == 'f':
+                    try:
+                        # Accept v, v/vt, v/vt/vn, v//vn — grab vertex only
+                        idxs = [int(p.split('/')[0]) for p in parts[1:]]
+                        nv = len(vertices)
+                        resolved = [i - 1 if i > 0 else nv + i for i in idxs]
+                        # Fan-triangulate polygons with >3 verts
+                        for i in range(1, len(resolved) - 1):
+                            faces.append([resolved[0], resolved[i], resolved[i + 1]])
+                    except (IndexError, ValueError):
+                        pass
+    except Exception as exc:
+        print(f"    [OBJ] Warning: could not read "
+              f"{os.path.basename(filepath)}: {exc}")
+        return None, None
+
+    if len(vertices) < 3 or len(faces) < 1:
+        return None, None
+
+    verts = np.array(vertices, dtype=np.float32)
+    fcs = np.array(faces, dtype=np.int32)
+
+    # Remove faces with out-of-range vertex indices
+    valid = (fcs >= 0).all(axis=1) & (fcs < len(verts)).all(axis=1)
+    fcs = fcs[valid]
+    if len(fcs) < 1:
+        return None, None
+
+    # Normalise: centre at origin, longest axis → 1.8 units (fits in [-0.9, 0.9])
+    vmin, vmax = verts.min(axis=0), verts.max(axis=0)
+    centre = (vmin + vmax) * 0.5
+    span = (vmax - vmin).max()
+    if span > 1e-8:
+        verts = (verts - centre) * (1.8 / span)
+
+    return verts, fcs
+
+
+def mesh_to_sdf(vertices, faces, grid_res=48, rot_speed=1.5):
+    """Bake the mesh surface into a signed-distance grid and return a callable
+    ``sdf_func(p, t)`` compatible with the raymarching pipeline.
+
+    *p* – (N, 3) float32 query points in normalised model space.
+    *t* – animation time (float); the model rotates around Y at *rot_speed*
+          radians per time unit, matching the behaviour of the procedural SDFs.
+
+    The baking step (done once per object) samples the surface densely, builds
+    a KDTree, evaluates approximate signed distances on a regular 3-D grid, and
+    stores a trilinear interpolator for fast per-frame queries.
+    """
+    # ---- 1. Sample the surface densely with face normals ----
+    v0 = vertices[faces[:, 0]]
+    v1 = vertices[faces[:, 1]]
+    v2 = vertices[faces[:, 2]]
+
+    fn = np.cross(v1 - v0, v2 - v0).astype(np.float32)
+    fnl = np.sqrt((fn ** 2).sum(axis=-1, keepdims=True)) + 1e-8
+    fn = fn / fnl  # unit face normals
+
+    centroids = ((v0 + v1 + v2) / 3.0).astype(np.float32)
+
+    n_faces = len(faces)
+    n_extra = min(n_faces * 4, 200_000)  # cap to limit memory & build time
+    rng = np.random.RandomState(0)
+    fi = rng.randint(0, n_faces, n_extra)
+    r1 = rng.rand(n_extra).astype(np.float32)
+    r2 = rng.rand(n_extra).astype(np.float32)
+    mask_swap = (r1 + r2) > 1.0
+    r1[mask_swap] = 1.0 - r1[mask_swap]
+    r2[mask_swap] = 1.0 - r2[mask_swap]
+    r3 = 1.0 - r1 - r2
+    extra_pts = (vertices[faces[fi, 0]] * r3[:, None]
+                 + vertices[faces[fi, 1]] * r1[:, None]
+                 + vertices[faces[fi, 2]] * r2[:, None]).astype(np.float32)
+    extra_nrm = fn[fi]
+
+    surf_pts = np.vstack([centroids, extra_pts])
+    surf_nrm = np.vstack([fn, extra_nrm])
+
+    # ---- 2. KDTree over surface samples ----
+    tree = cKDTree(surf_pts)
+
+    # ---- 3. Evaluate SDF on a regular grid ----
+    coords = np.linspace(-1.0, 1.0, grid_res, dtype=np.float32)
+    gx, gy, gz = np.meshgrid(coords, coords, coords, indexing='ij')
+    grid_pts = np.stack([gx.ravel(), gy.ravel(), gz.ravel()],
+                        axis=-1).astype(np.float32)
+
+    sdf_vals = np.empty(len(grid_pts), dtype=np.float32)
+    chunk = 32_768
+    for s in range(0, len(grid_pts), chunk):
+        e = min(s + chunk, len(grid_pts))
+        gp = grid_pts[s:e]
+        dists, idx = tree.query(gp, k=1)
+        delta = gp - surf_pts[idx]
+        sign = np.sign((delta * surf_nrm[idx]).sum(axis=1))
+        sign[sign == 0] = 1.0
+        sdf_vals[s:e] = sign * dists.astype(np.float32)
+
+    sdf_grid = sdf_vals.reshape(grid_res, grid_res, grid_res)
+
+    # ---- 4. Fast trilinear interpolator ----
+    interp = RegularGridInterpolator(
+        (coords, coords, coords), sdf_grid,
+        method='linear', bounds_error=False, fill_value=1.0,
+    )
+
+    def sdf_from_grid(p, t):
+        angle = float(t) * rot_speed
+        ca, sa = np.cos(angle), np.sin(angle)
+        p_rot = np.empty_like(p)
+        p_rot[:, 0] = p[:, 0] * ca + p[:, 2] * sa
+        p_rot[:, 1] = p[:, 1]
+        p_rot[:, 2] = -p[:, 0] * sa + p[:, 2] * ca
+        return interp(p_rot).astype(np.float32)
+
+    return sdf_from_grid
+
+
+def get_sdf_for_object(obj_idx, obj_data):
+    """Return the SDF callable for *obj_idx*, loading the .obj file when
+    available.  Results are cached so the baking step runs only once per object.
+    Falls back gracefully to the procedural SDF when the file is missing or
+    cannot be parsed.
+    """
+    if obj_idx in _OBJ_SDF_CACHE:
+        return _OBJ_SDF_CACHE[obj_idx]
+
+    obj_file = obj_data.get('obj_file')
+    if obj_file:
+        filepath = os.path.join(_SCRIPT_DIR, obj_file)
+        if os.path.exists(filepath):
+            print(f"    [OBJ] Loading & baking: {obj_file} …")
+            verts, fcs = load_obj(filepath)
+            if verts is not None:
+                sdf_fn = mesh_to_sdf(verts, fcs)
+                _OBJ_SDF_CACHE[obj_idx] = sdf_fn
+                return sdf_fn
+            print(f"    [OBJ] Parse failed — using procedural SDF.")
+        else:
+            print(f"    [OBJ] File not found ({obj_file}) — using procedural SDF.")
+
+    # Procedural fallback
+    sdf_fn = SDF_FUNCS[obj_idx]
+    _OBJ_SDF_CACHE[obj_idx] = sdf_fn
+    return sdf_fn
+
+# ---------------------------------------------------------------------------
 # Section 8: RAYMARCHING ENGINE (optimized)
 # ---------------------------------------------------------------------------
 
@@ -1076,8 +1264,8 @@ SDF_FUNCS = [
 
 
 def generate_object_frames(obj_idx, obj_data, starfield, fonts):
-    sdf_func = SDF_FUNCS[obj_idx]
-    n_objects = len(SDF_FUNCS)
+    sdf_func = get_sdf_for_object(obj_idx, obj_data)
+    n_objects = len(OBJECTS)
     target = np.array([0, 0, 0], dtype=np.float32)
     frames = []
 
