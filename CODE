@@ -1,0 +1,1181 @@
+#!/usr/bin/env python3
+"""
+SIZE COMPARISON: FROM QUARK TO OBSERVABLE UNIVERSE — FAST VERSION
+Full HD 1920x1080 · ~3 min · Python + NumPy + Pillow + ffmpeg
+
+Renders internally at 480x270 and upscales with Lanczos for speed.
+Expected render time: 15-40 minutes (vs 11+ hours original).
+
+Dependencies:
+    pip install pillow imageio imageio-ffmpeg scipy tqdm numpy
+
+Usage:
+    python size_comparison_fast.py
+
+Output: size_comparison_3d.mp4
+"""
+
+# ---------------------------------------------------------------------------
+# Section 1: IMPORTS
+# ---------------------------------------------------------------------------
+import os
+import math
+import gc
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+import imageio
+from tqdm import tqdm
+from scipy.ndimage import gaussian_filter
+
+# ---------------------------------------------------------------------------
+# Section 2: CONFIGURATION
+# ---------------------------------------------------------------------------
+# Final output resolution
+WIDTH, HEIGHT = 1920, 1080
+
+# Internal render resolution (upscaled to final with Lanczos)
+RENDER_W, RENDER_H = 480, 270
+SCALE_FACTOR = WIDTH / RENDER_W  # 4x
+
+FPS_RENDER = 10          # render fewer unique frames
+FPS_OUTPUT = 30
+assert FPS_OUTPUT % FPS_RENDER == 0
+_FRAME_REPEAT = FPS_OUTPUT // FPS_RENDER  # 3x duplication
+
+BG_COLOR = (4, 3, 18)
+
+# Shorter timings per object for ~3min total with 18 objects
+SEC_APPEAR = 1.0
+SEC_HOLD = 4.0
+SEC_TRANSITION = 2.0
+
+F_APPEAR = int(SEC_APPEAR * FPS_RENDER)
+F_HOLD = int(SEC_HOLD * FPS_RENDER)
+F_TRANSITION = int(SEC_TRANSITION * FPS_RENDER)
+F_PER_OBJ = F_APPEAR + F_HOLD + F_TRANSITION
+
+# Raymarching — fewer steps, still good quality
+MAX_STEPS = 48
+MAX_DIST = 20.0
+SURF_DIST = 0.003
+
+# ---------------------------------------------------------------------------
+# Section 3: OBJECT DATA
+# ---------------------------------------------------------------------------
+OBJECTS = [
+    {
+        'name': 'Up Quark',
+        'size_m': 1e-18,
+        'color': (255, 80, 80),
+        'glow_color': (200, 20, 20),
+        'category': 'SUBATOMIC PARTICLE',
+        'facts': [
+            'One of the smallest known constituents of matter',
+            'Quarks are confined — never found alone (color confinement)',
+            'Charge: +2/3 e  |  Mass: ~2.3 MeV/c²',
+        ],
+        'si_label': '~10⁻¹⁸ m  (1 attometer)',
+        'us_label': '~3.9 × 10⁻¹⁷ inches',
+    },
+    {
+        'name': 'Proton',
+        'size_m': 1.7e-15,
+        'color': (255, 140, 60),
+        'glow_color': (200, 80, 10),
+        'category': 'SUBATOMIC PARTICLE',
+        'facts': [
+            'Made of 2 up quarks and 1 down quark',
+            'Radius ~0.85 femtometers; proton charge radius debate ongoing',
+            '~1836× heavier than the electron',
+        ],
+        'si_label': '1.7 × 10⁻¹⁵ m  (1.7 femtometers)',
+        'us_label': '6.7 × 10⁻¹⁴ inches',
+    },
+    {
+        'name': 'Hydrogen Atom',
+        'size_m': 1.2e-10,
+        'color': (80, 200, 255),
+        'glow_color': (20, 140, 220),
+        'category': 'ATOM',
+        'facts': [
+            'Smallest and most abundant element in the universe',
+            'Bohr radius ~53 pm; quantum cloud extends further',
+            '~100,000× larger than its nucleus',
+        ],
+        'si_label': '1.2 × 10⁻¹⁰ m  (0.12 nm)',
+        'us_label': '4.7 × 10⁻⁹ inches',
+    },
+    {
+        'name': 'DNA Molecule',
+        'size_m': 2.5e-9,
+        'color': (80, 220, 150),
+        'glow_color': (20, 160, 90),
+        'category': 'MOLECULE',
+        'facts': [
+            'Double helix diameter ~2.5 nm; encodes all life',
+            'Human DNA stretched out would reach ~2 meters',
+            '~6 billion base pairs in human genome',
+        ],
+        'si_label': '2.5 × 10⁻⁹ m  (2.5 nm)',
+        'us_label': '9.8 × 10⁻⁸ inches',
+    },
+    {
+        'name': 'SARS-CoV-2 Virus',
+        'size_m': 1.2e-7,
+        'color': (220, 80, 220),
+        'glow_color': (160, 20, 160),
+        'category': 'VIRUS',
+        'facts': [
+            'Diameter ~100–140 nm with distinctive spike proteins',
+            'Spike proteins bind to ACE2 receptors in human cells',
+            'RNA genome ~30,000 nucleotides long',
+        ],
+        'si_label': '1.2 × 10⁻⁷ m  (120 nm)',
+        'us_label': '4.7 × 10⁻⁶ inches',
+    },
+    {
+        'name': 'Red Blood Cell',
+        'size_m': 8e-6,
+        'color': (220, 40, 40),
+        'glow_color': (160, 10, 10),
+        'category': 'CELL',
+        'facts': [
+            'Biconcave disc ~6–8 µm in diameter',
+            'No nucleus — maximises oxygen-carrying haemoglobin',
+            '~25 trillion red blood cells in the human body',
+        ],
+        'si_label': '8 × 10⁻⁶ m  (8 micrometers)',
+        'us_label': '3.1 × 10⁻⁴ inches',
+    },
+    {
+        'name': 'Ant',
+        'size_m': 2e-3,
+        'color': (160, 100, 40),
+        'glow_color': (100, 60, 10),
+        'category': 'INSECT',
+        'facts': [
+            'Can lift 10–50× its own body weight',
+            'About 20 quadrillion ants live on Earth',
+            'Highly eusocial; colonies can have millions of workers',
+        ],
+        'si_label': '2 × 10⁻³ m  (2 mm)',
+        'us_label': '0.08 inches',
+    },
+    {
+        'name': 'Human',
+        'size_m': 1.75,
+        'color': (220, 170, 130),
+        'glow_color': (160, 110, 70),
+        'category': 'ORGANISM',
+        'facts': [
+            'Average height ~1.75 m (5 ft 9 in)',
+            'Body contains ~37 trillion cells',
+            '~8 billion humans currently on Earth',
+        ],
+        'si_label': '1.75 m',
+        'us_label': '5 ft 9 in  (69 inches)',
+    },
+    {
+        'name': 'Eiffel Tower',
+        'size_m': 324.0,
+        'color': (160, 150, 130),
+        'glow_color': (100, 90, 70),
+        'category': 'STRUCTURE',
+        'facts': [
+            'Height 324 m including antenna; completed 1889',
+            'Made of ~7,300 tonnes of wrought iron',
+            'Visited by ~7 million people per year',
+        ],
+        'si_label': '324 m',
+        'us_label': '1,063 feet  (0.2 miles)',
+    },
+    {
+        'name': 'Mount Everest',
+        'size_m': 8848.86,
+        'color': (200, 200, 210),
+        'glow_color': (140, 140, 160),
+        'category': 'MOUNTAIN',
+        'facts': [
+            'Highest point on Earth at 8,848.86 m above sea level',
+            'Part of the Himalayan range; still rising ~4 mm/year',
+            'First summited by Hillary & Tenzing on 29 May 1953',
+        ],
+        'si_label': '8,848.86 m  (8.85 km)',
+        'us_label': '29,032 feet  (5.5 miles)',
+    },
+    {
+        'name': 'Earth',
+        'size_m': 1.274e7,
+        'color': (60, 130, 200),
+        'glow_color': (30, 80, 150),
+        'category': 'PLANET',
+        'facts': [
+            'Mean diameter 12,742 km; slightly oblate at poles',
+            'Only known planet harboring life',
+            'Surface is 71% water; 1 Moon in orbit',
+        ],
+        'si_label': '12,742 km',
+        'us_label': '7,918 miles',
+    },
+    {
+        'name': 'Jupiter',
+        'size_m': 1.4e8,
+        'color': (210, 160, 100),
+        'glow_color': (160, 110, 60),
+        'category': 'PLANET',
+        'facts': [
+            'Largest planet; diameter ~11× Earth\'s',
+            'Great Red Spot is a storm lasting >350 years',
+            '95 known moons including Ganymede, Europa, Io',
+        ],
+        'si_label': '139,820 km',
+        'us_label': '86,881 miles',
+    },
+    {
+        'name': 'The Sun',
+        'size_m': 1.39e9,
+        'color': (255, 220, 60),
+        'glow_color': (220, 160, 10),
+        'category': 'STAR',
+        'facts': [
+            'Diameter ~1.39 million km; ~109× Earth\'s diameter',
+            'Contains 99.86% of the Solar System\'s total mass',
+            'Core temperature ~15 million °C; fuses 600 Mt H/s',
+        ],
+        'si_label': '1,392,700 km',
+        'us_label': '865,370 miles',
+    },
+    {
+        'name': 'Solar System',
+        'size_m': 9e12,
+        'color': (180, 180, 220),
+        'glow_color': (120, 120, 160),
+        'category': 'PLANETARY SYSTEM',
+        'facts': [
+            'Diameter to heliopause ~9 trillion km (~60 AU)',
+            'Orbits take 0.24 y (Mercury) to 165 y (Neptune)',
+            'Oort Cloud extends to ~100,000 AU',
+        ],
+        'si_label': '~9 × 10¹² m  (9 trillion km)',
+        'us_label': '~5.6 × 10¹² miles',
+    },
+    {
+        'name': 'Light Year',
+        'size_m': 9.461e15,
+        'color': (100, 180, 255),
+        'glow_color': (60, 120, 200),
+        'category': 'ASTRONOMICAL DISTANCE',
+        'facts': [
+            'Distance light travels in one year: ~9.46 × 10¹⁵ m',
+            '~63,241 AU; ~5.88 trillion miles',
+            'Nearest star (Proxima Centauri) is 4.24 light years away',
+        ],
+        'si_label': '9.461 × 10¹⁵ m',
+        'us_label': '5.879 × 10¹² miles',
+    },
+    {
+        'name': 'Milky Way Galaxy',
+        'size_m': 9.461e20,
+        'color': (200, 180, 255),
+        'glow_color': (140, 120, 200),
+        'category': 'GALAXY',
+        'facts': [
+            'Diameter ~100,000 light years; barred spiral galaxy',
+            'Contains 100–400 billion stars',
+            'Our Solar System orbits the centre every ~225–250 Myr',
+        ],
+        'si_label': '9.461 × 10²⁰ m  (100,000 ly)',
+        'us_label': '5.88 × 10¹⁷ miles',
+    },
+    {
+        'name': 'Local Group',
+        'size_m': 3.086e22,
+        'color': (160, 200, 255),
+        'glow_color': (100, 140, 200),
+        'category': 'GALAXY GROUP',
+        'facts': [
+            'Diameter ~3 million light years; ~50+ galaxies',
+            'Dominated by Milky Way and Andromeda (M31)',
+            'Andromeda is approaching at ~110 km/s; merge in ~4.5 Gyr',
+        ],
+        'si_label': '3.086 × 10²² m  (~3 Mly)',
+        'us_label': '~1.92 × 10¹⁹ miles',
+    },
+    {
+        'name': 'Observable Universe',
+        'size_m': 8.8e26,
+        'color': (180, 160, 255),
+        'glow_color': (120, 100, 220),
+        'category': 'COSMOS',
+        'facts': [
+            'Diameter ~93 billion light years due to expansion',
+            'Contains ~2 trillion galaxies and ~10⁸⁰ atoms',
+            'Age ~13.8 billion years since the Big Bang',
+        ],
+        'si_label': '8.8 × 10²⁶ m  (~93 billion ly)',
+        'us_label': '~5.5 × 10²³ miles',
+    },
+]
+
+# ---------------------------------------------------------------------------
+# Section 4: MATH UTILITIES
+# ---------------------------------------------------------------------------
+
+def ease_in_out_cubic(t):
+    if t < 0.5:
+        return 4 * t * t * t
+    p = 2 * t - 2
+    return 1.0 - p * p * p / 2
+
+
+def ease_out_bounce(t):
+    n1, d1 = 7.5625, 2.75
+    if t < 1 / d1:
+        return n1 * t * t
+    elif t < 2 / d1:
+        t -= 1.5 / d1
+        return n1 * t * t + 0.75
+    elif t < 2.5 / d1:
+        t -= 2.25 / d1
+        return n1 * t * t + 0.9375
+    else:
+        t -= 2.625 / d1
+        return n1 * t * t + 0.984375
+
+
+def rot_x(angle):
+    c, s = np.cos(angle), np.sin(angle)
+    return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float32)
+
+
+def rot_y(angle):
+    c, s = np.cos(angle), np.sin(angle)
+    return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=np.float32)
+
+
+def rot_z(angle):
+    c, s = np.cos(angle), np.sin(angle)
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float32)
+
+
+def apply_rotation(p, R):
+    return p @ R.T
+
+# ---------------------------------------------------------------------------
+# Section 5: SDF PRIMITIVES (identical to original)
+# ---------------------------------------------------------------------------
+
+def sdf_sphere(p, center, radius):
+    center = np.asarray(center, dtype=np.float32)
+    d = p - center
+    return np.sqrt(np.sum(d * d, axis=-1)) - radius
+
+
+def sdf_box(p, center, half_extents):
+    center = np.asarray(center, dtype=np.float32)
+    half_extents = np.asarray(half_extents, dtype=np.float32)
+    q = np.abs(p - center) - half_extents
+    return (np.sqrt(np.sum(np.maximum(q, 0.0) ** 2, axis=-1))
+            + np.minimum(np.max(q, axis=-1), 0.0))
+
+
+def sdf_capsule(p, a, b, radius):
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    pa = p - a
+    ba = b - a
+    h = np.clip(np.sum(pa * ba, axis=-1) / (np.sum(ba * ba) + 1e-10), 0.0, 1.0)
+    d = pa - ba * h[..., np.newaxis]
+    return np.sqrt(np.sum(d * d, axis=-1)) - radius
+
+
+def sdf_cylinder(p, a, b, radius):
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    ba = b - a
+    pa = p - a
+    baba = np.dot(ba, ba) + 1e-10
+    paba = np.sum(pa * ba, axis=-1) / baba
+    x = np.sqrt(np.sum((pa - ba * paba[..., np.newaxis]) ** 2, axis=-1) + 1e-10) - radius
+    y = (np.abs(paba - 0.5) - 0.5) * np.sqrt(baba)
+    x2 = x * x
+    y2 = y * y
+    d = np.where(
+        np.maximum(x, y) < 0,
+        -np.minimum(np.abs(x), np.abs(y)),
+        np.where(x > 0, np.where(y > 0, np.sqrt(x2 + y2), x), y),
+    )
+    return d
+
+
+def sdf_torus(p, center, R, r):
+    center = np.asarray(center, dtype=np.float32)
+    q = p - center
+    xz = np.stack([q[..., 0], q[..., 2]], axis=-1)
+    xz_len = np.sqrt(np.sum(xz ** 2, axis=-1)) - R
+    d = np.stack([xz_len, q[..., 1]], axis=-1)
+    return np.sqrt(np.sum(d ** 2, axis=-1)) - r
+
+
+def sdf_ellipsoid(p, center, radii):
+    center = np.asarray(center, dtype=np.float32)
+    radii = np.asarray(radii, dtype=np.float32)
+    q = (p - center) / (radii + 1e-10)
+    ql = np.sqrt(np.sum(q ** 2, axis=-1))
+    min_r = np.min(radii)
+    return (ql - 1.0) * min_r
+
+
+def sdf_cone(p, tip, base_center, radius):
+    tip = np.asarray(tip, dtype=np.float32)
+    base_center = np.asarray(base_center, dtype=np.float32)
+    d = base_center - tip
+    h = np.sqrt(np.sum(d ** 2)) + 1e-10
+    axis = d / h
+    pa = p - tip
+    t = np.clip(np.sum(pa * axis, axis=-1), 0.0, h)
+    closest = tip + axis * t[..., np.newaxis]
+    radial_r = radius * t / h
+    q = p - closest
+    return np.sqrt(np.sum(q ** 2, axis=-1) + 1e-10) - radial_r
+
+# ---------------------------------------------------------------------------
+# Section 6: SDF BOOLEAN OPERATIONS
+# ---------------------------------------------------------------------------
+
+def sdf_union(d1, d2):
+    return np.minimum(d1, d2)
+
+
+def sdf_subtract(d1, d2):
+    return np.maximum(d1, -d2)
+
+
+def sdf_intersect(d1, d2):
+    return np.maximum(d1, d2)
+
+
+def sdf_smooth_union(d1, d2, k=0.1):
+    h = np.clip(0.5 + 0.5 * (d2 - d1) / (k + 1e-10), 0.0, 1.0)
+    return d2 * (1 - h) + d1 * h - k * h * (1 - h)
+
+# ---------------------------------------------------------------------------
+# Section 7: SDF OBJECT MODELS (identical quality to original)
+# ---------------------------------------------------------------------------
+
+def sdf_quark(p, t):
+    pulse = 0.15 + 0.03 * np.sin(t * np.pi * 6)
+    center = np.array([0, 0, 0], dtype=np.float32)
+    core = sdf_sphere(p, center, pulse)
+    ring1 = sdf_torus(p, center, 0.35, 0.04)
+    R60 = rot_x(np.radians(60.0))
+    ring2 = sdf_torus(apply_rotation(p, R60), center, 0.35, 0.04)
+    R120 = rot_x(np.radians(120.0))
+    ring3 = sdf_torus(apply_rotation(p, R120), center, 0.35, 0.04)
+    glow = sdf_sphere(p, center, 0.55)
+    d = sdf_smooth_union(core, ring1, k=0.08)
+    d = sdf_smooth_union(d, ring2, k=0.08)
+    d = sdf_smooth_union(d, ring3, k=0.08)
+    d = sdf_smooth_union(d, glow, k=0.12)
+    return d
+
+
+def sdf_proton(p, t):
+    q1 = np.array([0.3, 0, 0], dtype=np.float32)
+    q2 = np.array([-0.15, 0.26, 0], dtype=np.float32)
+    q3 = np.array([-0.15, -0.26, 0], dtype=np.float32)
+    d = sdf_smooth_union(sdf_sphere(p, q1, 0.18), sdf_sphere(p, q2, 0.18), k=0.06)
+    d = sdf_smooth_union(d, sdf_sphere(p, q3, 0.18), k=0.06)
+    d = sdf_smooth_union(d, sdf_cylinder(p, q1, q2, 0.05), k=0.04)
+    d = sdf_smooth_union(d, sdf_cylinder(p, q2, q3, 0.05), k=0.04)
+    d = sdf_smooth_union(d, sdf_cylinder(p, q3, q1, 0.05), k=0.04)
+    d = sdf_smooth_union(d, sdf_sphere(p, np.zeros(3, dtype=np.float32), 0.55), k=0.10)
+    return d
+
+
+def sdf_hydrogen(p, t):
+    center = np.zeros(3, dtype=np.float32)
+    nucleus = sdf_sphere(p, center, 0.12)
+    shell = np.abs(sdf_sphere(p, center, 0.8)) - 0.05
+    torus1 = sdf_torus(p, center, 0.8, 0.03)
+    torus2 = sdf_torus(apply_rotation(p, rot_z(np.radians(45.0))), center, 0.8, 0.03)
+    d = sdf_smooth_union(nucleus, shell, k=0.05)
+    d = sdf_smooth_union(d, torus1, k=0.04)
+    d = sdf_smooth_union(d, torus2, k=0.04)
+    return d
+
+
+def sdf_dna(p, t):
+    two_pi = 2.0 * np.pi
+    d = np.full(p.shape[0], 1e9, dtype=np.float32)
+    pts_l, pts_r = [], []
+    for i in range(21):
+        angle = i * (two_pi / 10.0) + t * np.pi
+        y = i * 0.12 - 1.2
+        pts_l.append(np.array([0.25 * np.cos(angle), y, 0.25 * np.sin(angle)], dtype=np.float32))
+        pts_r.append(np.array([0.25 * np.cos(angle + np.pi), y, 0.25 * np.sin(angle + np.pi)], dtype=np.float32))
+    for i in range(20):
+        d = np.minimum(d, sdf_capsule(p, pts_l[i], pts_l[i+1], 0.04))
+        d = np.minimum(d, sdf_capsule(p, pts_r[i], pts_r[i+1], 0.04))
+        ml = (pts_l[i] + pts_l[i+1]) * 0.5
+        mr = (pts_r[i] + pts_r[i+1]) * 0.5
+        d = np.minimum(d, sdf_capsule(p, ml, mr, 0.03))
+    return d
+
+
+def sdf_coronavirus(p, t):
+    center = np.zeros(3, dtype=np.float32)
+    d = sdf_sphere(p, center, 0.45)
+    golden = (1.0 + np.sqrt(5.0)) / 2.0
+    for k in range(20):
+        theta = np.arccos(1.0 - 2.0 * (k + 0.5) / 20)
+        phi = 2.0 * np.pi * k / golden
+        dir_v = np.array([np.sin(theta)*np.cos(phi), np.cos(theta), np.sin(theta)*np.sin(phi)], dtype=np.float32)
+        base = dir_v * 0.45
+        tip = dir_v * 0.75
+        d = np.minimum(d, sdf_cylinder(p, base, tip, 0.04))
+        d = np.minimum(d, sdf_sphere(p, tip, 0.07))
+    return d
+
+
+def sdf_rbc(p, t):
+    p_flat = np.stack([p[:, 0], p[:, 1] * 2.5, p[:, 2]], axis=-1).astype(np.float32)
+    base = sdf_torus(p_flat, np.zeros(3, dtype=np.float32), 0.35, 0.28)
+    shape = sdf_subtract(base, sdf_sphere(p, np.array([0, 0.12, 0], dtype=np.float32), 0.22))
+    shape = sdf_subtract(shape, sdf_sphere(p, np.array([0, -0.12, 0], dtype=np.float32), 0.22))
+    return shape
+
+
+def sdf_ant(p, t):
+    head = sdf_ellipsoid(p, np.array([-0.55, 0.05, 0], dtype=np.float32), np.array([0.12, 0.11, 0.10], dtype=np.float32))
+    thorax = sdf_ellipsoid(p, np.array([-0.1, 0, 0], dtype=np.float32), np.array([0.15, 0.12, 0.13], dtype=np.float32))
+    abdomen = sdf_ellipsoid(p, np.array([0.35, -0.05, 0], dtype=np.float32), np.array([0.25, 0.18, 0.20], dtype=np.float32))
+    neck = sdf_capsule(p, np.array([-0.43, 0, 0], dtype=np.float32), np.array([-0.25, 0, 0], dtype=np.float32), 0.06)
+    petiole = sdf_capsule(p, np.array([0.05, -0.02, 0], dtype=np.float32), np.array([0.15, -0.04, 0], dtype=np.float32), 0.05)
+    d = sdf_smooth_union(head, thorax, k=0.05)
+    d = sdf_smooth_union(d, abdomen, k=0.05)
+    d = sdf_smooth_union(d, neck, k=0.04)
+    d = sdf_smooth_union(d, petiole, k=0.04)
+    legs = [
+        ([-0.2, -0.05, 0.13], [-0.3, -0.35, 0.25]),
+        ([-0.05, -0.06, 0.13], [-0.05, -0.38, 0.28]),
+        ([0.1, -0.06, 0.13], [0.2, -0.36, 0.25]),
+        ([-0.2, -0.05, -0.13], [-0.3, -0.35, -0.25]),
+        ([-0.05, -0.06, -0.13], [-0.05, -0.38, -0.28]),
+        ([0.1, -0.06, -0.13], [0.2, -0.36, -0.25]),
+    ]
+    for a, b in legs:
+        d = np.minimum(d, sdf_capsule(p, np.array(a, dtype=np.float32), np.array(b, dtype=np.float32), 0.025))
+    antennae = [
+        ([-0.6, 0.15, 0.05], [-0.9, 0.45, 0.12]),
+        ([-0.6, 0.15, -0.05], [-0.9, 0.45, -0.12]),
+    ]
+    for a, b in antennae:
+        d = np.minimum(d, sdf_capsule(p, np.array(a, dtype=np.float32), np.array(b, dtype=np.float32), 0.018))
+        d = np.minimum(d, sdf_sphere(p, np.array(b, dtype=np.float32), 0.025))
+    mandibles = [
+        ([-0.67, 0, 0.05], [-0.80, -0.06, 0.10]),
+        ([-0.67, 0, -0.05], [-0.80, -0.06, -0.10]),
+    ]
+    for a, b in mandibles:
+        d = np.minimum(d, sdf_capsule(p, np.array(a, dtype=np.float32), np.array(b, dtype=np.float32), 0.020))
+    return d
+
+
+def sdf_human(p, t):
+    head = sdf_ellipsoid(p, np.array([0, 0.82, 0], dtype=np.float32), np.array([0.11, 0.135, 0.11], dtype=np.float32))
+    neck = sdf_capsule(p, np.array([0, 0.68, 0], dtype=np.float32), np.array([0, 0.75, 0], dtype=np.float32), 0.045)
+    torso = sdf_capsule(p, np.array([0, 0.25, 0], dtype=np.float32), np.array([0, 0.66, 0], dtype=np.float32), 0.16)
+    d = sdf_smooth_union(head, neck, k=0.04)
+    d = sdf_smooth_union(d, torso, k=0.05)
+    parts = [
+        ('sphere', [[-0.22, 0.62, 0], 0.08]),
+        ('sphere', [[0.22, 0.62, 0], 0.08]),
+        ('capsule', [[-0.22, 0.62, 0], [-0.36, 0.35, 0.04], 0.055]),
+        ('capsule', [[0.22, 0.62, 0], [0.36, 0.35, 0.04], 0.055]),
+        ('capsule', [[-0.36, 0.35, 0.04], [-0.44, 0.08, 0.05], 0.045]),
+        ('capsule', [[0.36, 0.35, 0.04], [0.44, 0.08, 0.05], 0.045]),
+        ('ellipsoid', [[-0.46, 0.01, 0.06], [0.045, 0.07, 0.03]]),
+        ('ellipsoid', [[0.46, 0.01, 0.06], [0.045, 0.07, 0.03]]),
+        ('capsule', [[-0.09, 0.18, 0], [-0.12, 0.10, 0], 0.07]),
+        ('capsule', [[0.09, 0.18, 0], [0.12, 0.10, 0], 0.07]),
+        ('capsule', [[-0.1, 0.1, 0], [-0.11, -0.28, 0.02], 0.08]),
+        ('capsule', [[0.1, 0.1, 0], [0.11, -0.28, 0.02], 0.08]),
+        ('capsule', [[-0.11, -0.28, 0.02], [-0.10, -0.65, 0.01], 0.065]),
+        ('capsule', [[0.11, -0.28, 0.02], [0.10, -0.65, 0.01], 0.065]),
+        ('ellipsoid', [[-0.10, -0.70, 0.05], [0.055, 0.04, 0.1]]),
+        ('ellipsoid', [[0.10, -0.70, 0.05], [0.055, 0.04, 0.1]]),
+    ]
+    for ptype, args in parts:
+        if ptype == 'sphere':
+            sd = sdf_sphere(p, np.array(args[0], dtype=np.float32), args[1])
+        elif ptype == 'capsule':
+            sd = sdf_capsule(p, np.array(args[0], dtype=np.float32), np.array(args[1], dtype=np.float32), args[2])
+        elif ptype == 'ellipsoid':
+            sd = sdf_ellipsoid(p, np.array(args[0], dtype=np.float32), np.array(args[1], dtype=np.float32))
+        d = sdf_smooth_union(d, sd, k=0.04)
+    return d
+
+
+def sdf_eiffel_tower(p, t):
+    legs = [
+        ([-0.7, -1.0, -0.7], [-0.05, 0.0, -0.05], 0.06),
+        ([0.7, -1.0, -0.7], [0.05, 0.0, -0.05], 0.06),
+        ([-0.7, -1.0, 0.7], [-0.05, 0.0, 0.05], 0.06),
+        ([0.7, -1.0, 0.7], [0.05, 0.0, 0.05], 0.06),
+        ([-0.05, 0.0, -0.05], [-0.02, 0.7, -0.02], 0.04),
+        ([0.05, 0.0, -0.05], [0.02, 0.7, -0.02], 0.04),
+        ([-0.05, 0.0, 0.05], [-0.02, 0.7, 0.02], 0.04),
+        ([0.05, 0.0, 0.05], [0.02, 0.7, 0.02], 0.04),
+    ]
+    d = sdf_capsule(p, np.array(legs[0][0], dtype=np.float32), np.array(legs[0][1], dtype=np.float32), legs[0][2])
+    for a, b, r in legs[1:]:
+        d = np.minimum(d, sdf_capsule(p, np.array(a, dtype=np.float32), np.array(b, dtype=np.float32), r))
+    decks = [
+        ([0, -0.38, 0], [0.55, 0.03, 0.55]),
+        ([0, 0.12, 0], [0.25, 0.03, 0.25]),
+        ([0, 0.55, 0], [0.10, 0.025, 0.10]),
+    ]
+    for c, he in decks:
+        d = np.minimum(d, sdf_box(p, np.array(c, dtype=np.float32), np.array(he, dtype=np.float32)))
+    d = np.minimum(d, sdf_capsule(p, np.array([0, 0.7, 0], dtype=np.float32), np.array([0, 1.0, 0], dtype=np.float32), 0.015))
+    braces = [
+        ([0, -0.7, 0], [0.58, 0.015, 0.02]),
+        ([0, -0.7, 0], [0.02, 0.015, 0.58]),
+        ([0, -0.1, 0], [0.28, 0.012, 0.02]),
+        ([0, -0.1, 0], [0.02, 0.012, 0.28]),
+    ]
+    for c, he in braces:
+        d = np.minimum(d, sdf_box(p, np.array(c, dtype=np.float32), np.array(he, dtype=np.float32)))
+    return d
+
+
+def sdf_everest(p, t):
+    main_cone = sdf_cone(p, np.array([0, 1.0, 0], dtype=np.float32), np.array([0, -0.8, 0], dtype=np.float32), 1.2)
+    noise = 0.04 * np.sin(p[:, 0] * 8.0) * np.cos(p[:, 2] * 8.0)
+    d = main_cone + noise
+    d = sdf_union(d, sdf_cone(p, np.array([0.3, 0.7, 0.1], dtype=np.float32), np.array([0.5, -0.5, 0.2], dtype=np.float32), 0.5))
+    d = sdf_union(d, sdf_cone(p, np.array([-0.4, 0.5, -0.1], dtype=np.float32), np.array([-0.6, -0.6, -0.2], dtype=np.float32), 0.45))
+    d = sdf_smooth_union(d, sdf_sphere(p, np.array([0, 0.88, 0], dtype=np.float32), 0.20), k=0.06)
+    return d
+
+
+def sdf_earth(p, t):
+    R = rot_y(t * 2.0 * np.pi * 0.1)
+    p_rot = apply_rotation(p, R)
+    main = sdf_ellipsoid(p_rot, np.zeros(3, dtype=np.float32), np.array([1.005, 1.0, 1.005], dtype=np.float32))
+    atmo = np.abs(sdf_sphere(p, np.zeros(3, dtype=np.float32), 1.06)) - 0.015
+    return sdf_smooth_union(main, atmo, k=0.05)
+
+
+def sdf_jupiter(p, t):
+    R = rot_y(t * 0.5)
+    p_rot = apply_rotation(p, R)
+    oblate = sdf_ellipsoid(p_rot, np.zeros(3, dtype=np.float32), np.array([1.065, 1.0, 1.065], dtype=np.float32))
+    angle = t * 0.3
+    spot_pos = np.array([np.cos(angle)*1.07, -0.22, np.sin(angle)*1.07], dtype=np.float32)
+    return sdf_smooth_union(oblate, sdf_sphere(p, spot_pos, 0.12), k=0.05)
+
+
+def sdf_sun(p, t):
+    center = np.zeros(3, dtype=np.float32)
+    main = sdf_sphere(p, center, 1.0)
+    corona = np.abs(sdf_sphere(p, center, 1.15)) - 0.08
+    d = sdf_smooth_union(main, corona, k=0.06)
+    for angle_deg in [30, 70, 150]:
+        R = rot_x(np.radians(float(angle_deg)))
+        r_val = 1.02 + angle_deg * 0.0003
+        d = sdf_smooth_union(d, sdf_torus(apply_rotation(p, R), center, r_val, 0.04), k=0.04)
+    return d
+
+
+def sdf_solar_system(p, t):
+    center = np.zeros(3, dtype=np.float32)
+    d = sdf_sphere(p, center, 0.08)
+    orbit_r = [0.15, 0.22, 0.30, 0.40, 0.65, 0.82, 0.94, 1.05]
+    speeds = [4.74, 3.50, 2.98, 2.41, 1.31, 0.97, 0.68, 0.54]
+    p_sizes = [0.008, 0.014, 0.015, 0.010, 0.040, 0.032, 0.025, 0.024]
+    for r_o, spd, ps in zip(orbit_r, speeds, p_sizes):
+        d = np.minimum(d, sdf_torus(p, center, r_o, 0.008))
+        a = t * 2.0 * np.pi * spd
+        d = np.minimum(d, sdf_sphere(p, np.array([r_o*np.cos(a), 0, r_o*np.sin(a)], dtype=np.float32), ps))
+    return d
+
+
+def sdf_lightyear(p, t):
+    d = sdf_cylinder(p, np.array([0, -1, 0], dtype=np.float32), np.array([0, 1, 0], dtype=np.float32), 0.06)
+    for i in range(12):
+        y = -0.9 + i * 0.15
+        d = np.minimum(d, sdf_box(p, np.array([0, y, 0], dtype=np.float32), np.array([0.12, 0.008, 0.008], dtype=np.float32)))
+    for ox, oz in [(-0.15, 0), (0.15, 0), (0, -0.15), (0, 0.15)]:
+        d = np.minimum(d, sdf_cylinder(p, np.array([ox, -1, oz], dtype=np.float32), np.array([ox, 1, oz], dtype=np.float32), 0.015))
+    for sx, sy, sz in [(0.4,-0.8,0.2),(-0.3,0.5,0.35),(0.5,0.1,-0.4),(-0.5,-0.3,-0.2),(0.3,0.7,-0.3),(-0.4,-0.6,0.3),(0.45,-0.2,0.4),(-0.35,0.3,-0.45)]:
+        d = np.minimum(d, sdf_sphere(p, np.array([sx, sy, sz], dtype=np.float32), 0.02))
+    return d
+
+
+def sdf_milkyway(p, t):
+    center = np.zeros(3, dtype=np.float32)
+    disc = sdf_ellipsoid(p, center, np.array([1.0, 0.08, 1.0], dtype=np.float32))
+    bulge = sdf_sphere(p, center, 0.22)
+    d = sdf_smooth_union(disc, bulge, k=0.08)
+    for k_arm in range(4):
+        sa = k_arm * (np.pi / 2.0)
+        for j in range(6):
+            a0 = sa + j * 0.4; a1 = sa + (j+1) * 0.4
+            r0 = 0.15 + j * 0.12; r1 = 0.15 + (j+1) * 0.12
+            y0 = (j-3)*0.01; y1 = (j+1-3)*0.01
+            pt0 = np.array([r0*np.cos(a0), y0, r0*np.sin(a0)], dtype=np.float32)
+            pt1 = np.array([r1*np.cos(a1), y1, r1*np.sin(a1)], dtype=np.float32)
+            d = sdf_smooth_union(d, sdf_capsule(p, pt0, pt1, 0.02), k=0.04)
+    return d
+
+
+def sdf_local_group(p, t):
+    center = np.zeros(3, dtype=np.float32)
+    mw = sdf_ellipsoid(p, center, np.array([0.35, 0.04, 0.35], dtype=np.float32))
+    R_and = rot_y(np.pi / 6.0)
+    p_and = apply_rotation(p - np.array([0.8, 0.1, 0.3], dtype=np.float32), R_and)
+    andromeda = sdf_ellipsoid(p_and, center, np.array([0.30, 0.035, 0.30], dtype=np.float32))
+    d = np.minimum(mw, andromeda)
+    for dx, dy, dz in [(0.4,0.1,0.5),(-0.5,-0.1,0.2),(0.2,0.2,-0.7),(-0.6,0.15,-0.4),(0.7,-0.15,0.5),(-0.3,-0.2,-0.6),(0.5,0.1,-0.5),(-0.7,0.05,0.3)]:
+        d = np.minimum(d, sdf_sphere(p, np.array([dx, dy, dz], dtype=np.float32), 0.04))
+    for dx, dy, dz in [(-0.2,0.3,0.4),(0.4,-0.2,-0.3),(-0.45,0.2,0.55),(0.6,-0.1,-0.25)]:
+        d = np.minimum(d, sdf_sphere(p, np.array([dx, dy, dz], dtype=np.float32), 0.03))
+    return d
+
+
+def sdf_observable_universe(p, t):
+    R = rot_y(t * 0.2 * np.pi)
+    p_rot = apply_rotation(p, R)
+    d = np.abs(sdf_sphere(p_rot, np.zeros(3, dtype=np.float32), 1.0)) - 0.02
+    filaments = [
+        ([-0.8,0.2,0.3],[0.7,-0.1,-0.4]), ([-0.5,-0.6,0.3],[0.5,0.7,-0.2]),
+        ([0.2,-0.7,0.5],[-0.1,0.6,-0.6]), ([0.6,0.3,-0.7],[-0.7,-0.2,0.4]),
+        ([-0.4,0.5,-0.6],[0.3,-0.6,0.5]), ([0.7,-0.5,0.2],[-0.6,0.3,-0.3]),
+        ([0.5,0.6,0.4],[-0.4,-0.5,-0.5]), ([-0.3,0.4,0.7],[0.3,-0.4,-0.7]),
+    ]
+    for a, b in filaments:
+        a_arr = np.array(a, dtype=np.float32); b_arr = np.array(b, dtype=np.float32)
+        d = np.minimum(d, sdf_capsule(p_rot, a_arr, b_arr, 0.03))
+        d = np.minimum(d, sdf_sphere(p_rot, (a_arr + b_arr) * 0.5, 0.05))
+    for ec in [[0.3,0.3,0.3],[-0.3,-0.3,-0.3],[0.4,-0.3,0.2],[-0.2,0.4,-0.3]]:
+        d = np.minimum(d, sdf_sphere(p_rot, np.array(ec, dtype=np.float32), 0.05))
+    return d
+
+# ---------------------------------------------------------------------------
+# Section 8: RAYMARCHING ENGINE (optimized)
+# ---------------------------------------------------------------------------
+
+def raymarch(ray_origins, ray_dirs, sdf_func, t_anim):
+    H, W = ray_origins.shape[:2]
+    t = np.full((H, W), 0.1, dtype=np.float32)
+    hit_mask = np.zeros((H, W), dtype=bool)
+    for step in range(MAX_STEPS):
+        active = (t < MAX_DIST) & (~hit_mask)
+        if not np.any(active):
+            break
+        p = ray_origins + ray_dirs * t[..., np.newaxis]
+        p_flat = p[active].reshape(-1, 3).astype(np.float32)
+        d = sdf_func(p_flat, t_anim).astype(np.float32)
+        step_mask = np.zeros((H, W), dtype=np.float32)
+        step_mask[active] = d
+        new_hits = active & (step_mask < SURF_DIST) & (step_mask > -SURF_DIST * 5)
+        hit_mask |= new_hits
+        t = np.where(active & ~new_hits, t + np.maximum(step_mask, SURF_DIST * 0.3), t)
+    t = np.where(hit_mask, t, MAX_DIST)
+    return t, hit_mask
+
+
+def estimate_normal(p_flat, sdf_func, t_anim, eps=0.004):
+    eps_arr = np.float32(eps)
+    dx = np.array([eps_arr, 0, 0], dtype=np.float32)
+    dy = np.array([0, eps_arr, 0], dtype=np.float32)
+    dz = np.array([0, 0, eps_arr], dtype=np.float32)
+    nx = sdf_func(p_flat + dx, t_anim) - sdf_func(p_flat - dx, t_anim)
+    ny = sdf_func(p_flat + dy, t_anim) - sdf_func(p_flat - dy, t_anim)
+    nz = sdf_func(p_flat + dz, t_anim) - sdf_func(p_flat - dz, t_anim)
+    n = np.stack([nx, ny, nz], axis=-1)
+    nl = np.sqrt(np.sum(n ** 2, axis=-1, keepdims=True)) + 1e-8
+    return (n / nl).astype(np.float32)
+
+# ---------------------------------------------------------------------------
+# Section 9: LIGHTING (optimized — 3 AO samples instead of 5)
+# ---------------------------------------------------------------------------
+
+def phong_lighting(normals, view_dir, light_dir, ambient=0.15, diffuse=0.7,
+                   specular=0.4, shininess=32.0, rim_strength=0.3):
+    ndotl = np.maximum(np.sum(normals * light_dir, axis=-1), 0.0)
+    light = ambient + diffuse * ndotl
+    half_vec = light_dir + view_dir
+    half_len = np.sqrt(np.sum(half_vec ** 2, axis=-1, keepdims=True)) + 1e-8
+    half_vec = half_vec / half_len
+    ndoth = np.maximum(np.sum(normals * half_vec, axis=-1), 0.0)
+    light += specular * (ndoth ** shininess)
+    rim = 1.0 - np.maximum(np.sum(normals * view_dir, axis=-1), 0.0)
+    light += rim_strength * (rim ** 3)
+    return light
+
+
+def compute_ao(hit_pos, normals, sdf_func, t_anim):
+    ao = np.zeros(hit_pos.shape[0], dtype=np.float32)
+    for i in range(1, 4):  # 3 samples instead of 5
+        step = 0.08 * i
+        p = hit_pos + normals * step
+        d = sdf_func(p, t_anim).astype(np.float32)
+        ao += (step - np.clip(d, 0.0, step)) / (2.0 ** i)
+    return np.clip(1.0 - 2.5 * ao, 0.0, 1.0)
+
+# ---------------------------------------------------------------------------
+# Section 10: RENDER PIPELINE (renders at RENDER_W x RENDER_H)
+# ---------------------------------------------------------------------------
+
+def render_frame(sdf_func, obj_data, camera_pos, camera_target, t_anim, scale=1.0):
+    """Render at low res, return [RENDER_H, RENDER_W, 3] uint8."""
+    camera_pos = np.asarray(camera_pos, dtype=np.float32)
+    camera_target = np.asarray(camera_target, dtype=np.float32)
+    fov = np.pi / 3.8
+    aspect = RENDER_W / RENDER_H
+
+    forward = camera_target - camera_pos
+    fwd_len = np.linalg.norm(forward)
+    forward = forward / fwd_len if fwd_len > 1e-8 else np.array([0, 0, -1], dtype=np.float32)
+
+    world_up = np.array([0, 1, 0], dtype=np.float32)
+    if abs(np.dot(forward, world_up)) > 0.99:
+        world_up = np.array([0, 0, 1], dtype=np.float32)
+    right = np.cross(forward, world_up)
+    right /= (np.linalg.norm(right) + 1e-8)
+    up = np.cross(right, forward)
+    up /= (np.linalg.norm(up) + 1e-8)
+
+    ys, xs = np.mgrid[0:RENDER_H, 0:RENDER_W].astype(np.float32)
+    ndc_x = (2.0 * (xs + 0.5) / RENDER_W - 1.0) * np.tan(fov / 2) * aspect
+    ndc_y = -(2.0 * (ys + 0.5) / RENDER_H - 1.0) * np.tan(fov / 2)
+
+    ray_dirs = (forward[None, None, :] + right[None, None, :] * ndc_x[:, :, None]
+                + up[None, None, :] * ndc_y[:, :, None])
+    ray_lens = np.sqrt(np.sum(ray_dirs ** 2, axis=-1, keepdims=True)) + 1e-8
+    ray_dirs = (ray_dirs / ray_lens).astype(np.float32)
+    ray_origins = np.broadcast_to(camera_pos, (RENDER_H, RENDER_W, 3)).copy().astype(np.float32)
+
+    def scaled_sdf(p_in, ta):
+        return sdf_func(p_in / scale, ta) * scale
+
+    hit_dist, hit_mask = raymarch(ray_origins, ray_dirs, scaled_sdf, t_anim)
+
+    frame = np.zeros((RENDER_H, RENDER_W, 3), dtype=np.float32)
+
+    if np.any(hit_mask):
+        hit_pos = (ray_origins[hit_mask] + ray_dirs[hit_mask] * hit_dist[hit_mask, None]).astype(np.float32)
+        normals = estimate_normal(hit_pos, scaled_sdf, t_anim)
+        view_dir = (-ray_dirs[hit_mask]).astype(np.float32)
+
+        light_pos = np.array([3.0, 4.0, 5.0], dtype=np.float32)
+        light_dir = light_pos - hit_pos
+        light_dir /= (np.sqrt(np.sum(light_dir ** 2, axis=-1, keepdims=True)) + 1e-8)
+
+        lighting = phong_lighting(normals, view_dir, light_dir,
+                                  ambient=0.18, diffuse=0.65, specular=0.45,
+                                  shininess=40.0, rim_strength=0.35)
+        ao = compute_ao(hit_pos, normals, scaled_sdf, t_anim)
+        lighting *= ao
+
+        base_color = np.array(obj_data['color'], dtype=np.float32) / 255.0
+        lit_color = base_color[None, :] * lighting[:, None]
+
+        fill_dir = np.array([-0.5, 0.3, -0.7], dtype=np.float32)
+        fill_dir /= (np.linalg.norm(fill_dir) + 1e-8)
+        fill_ndotl = np.maximum(np.sum(normals * fill_dir, axis=-1), 0.0)
+        lit_color += np.array([0.1, 0.15, 0.3], dtype=np.float32)[None, :] * (fill_ndotl * 0.25)[:, None]
+        frame[hit_mask] = np.clip(lit_color, 0.0, 1.0)
+
+    frame_u8 = np.clip(frame * 255, 0, 255).astype(np.uint8)
+    frame_f = frame_u8.astype(np.float32)
+
+    if np.any(hit_mask):
+        glow_color = np.array(obj_data['glow_color'], dtype=np.float32) / 255.0
+        glow_mask = gaussian_filter(hit_mask.astype(np.float32), sigma=3.0)  # smaller sigma for low res
+        for c in range(3):
+            frame_f[:, :, c] += glow_mask * glow_color[c] * 80.0
+
+    return np.clip(frame_f, 0, 255).astype(np.uint8)
+
+# ---------------------------------------------------------------------------
+# Section 11: STARFIELD (generated at full res)
+# ---------------------------------------------------------------------------
+
+def generate_starfield():
+    bg = np.zeros((HEIGHT, WIDTH, 3), dtype=np.float32)
+    rng = np.random.RandomState(42)
+    n_stars = 3000
+    sx = rng.randint(0, WIDTH, n_stars)
+    sy = rng.randint(0, HEIGHT, n_stars)
+    sb = np.clip(rng.exponential(0.5, n_stars), 0.0, 1.0)
+    for i in range(n_stars):
+        b = float(sb[i])
+        x, y = int(sx[i]), int(sy[i])
+        bg[y, x] = [b, b*0.9, b*0.8]
+        if b > 0.7 and 1 < x < WIDTH-2 and 1 < y < HEIGHT-2:
+            for dy, dx in [(-1,0),(1,0),(0,-1),(0,1)]:
+                bg[y+dy, x+dx] = [b*0.4, b*0.36, b*0.32]
+    nebula_colors = [np.array([0.4,0.1,0.6]), np.array([0.1,0.2,0.7]),
+                     np.array([0.6,0.1,0.2]), np.array([0.1,0.5,0.4]), np.array([0.3,0.2,0.5])]
+    for nc in nebula_colors:
+        cx = rng.randint(100, WIDTH-100); cy = rng.randint(100, HEIGHT-100)
+        sigma = rng.randint(120, 320)
+        ys, xs = np.ogrid[:HEIGHT, :WIDTH]
+        nebula = np.exp(-((xs-cx)**2 + (ys-cy)**2) / (2.0*sigma**2)).astype(np.float32)
+        bg += nebula[:, :, None] * nc[None, None, :] * 0.18
+    for c in range(3):
+        bg[:, :, c] = gaussian_filter(bg[:, :, c], sigma=1.2)
+    return np.clip(bg * 255, 0, 255).astype(np.uint8)
+
+
+def blend_with_starfield(frame_lowres, starfield, alpha=1.0):
+    """Upscale low-res render to full HD, composite over starfield."""
+    # Upscale with Lanczos
+    img_low = Image.fromarray(frame_lowres)
+    img_hd = img_low.resize((WIDTH, HEIGHT), Image.LANCZOS)
+    frame_f = np.array(img_hd).astype(np.float32)
+    star_f = starfield.astype(np.float32)
+
+    luminance = np.sum(frame_f, axis=-1)
+    obj_mask = (luminance > 8.0).astype(np.float32)
+    obj_mask_smooth = gaussian_filter(obj_mask, sigma=2.0)
+    obj_mask_smooth = np.clip(obj_mask_smooth, 0, 1)[:, :, None]
+
+    result = (frame_f * obj_mask_smooth + star_f * (1.0 - obj_mask_smooth))
+    result = (result * alpha + star_f * (1.0 - alpha) * 0.3
+              + np.array(BG_COLOR, dtype=np.float32)[None, None, :] * (1.0 - alpha) * 0.7)
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+# ---------------------------------------------------------------------------
+# Section 12: FONTS & TEXT (drawn at full res)
+# ---------------------------------------------------------------------------
+
+def load_fonts():
+    fonts = {}
+    paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "C:/Windows/Fonts/arialbd.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+    ]
+    found = None
+    for p in paths:
+        if os.path.exists(p):
+            found = p; break
+    sizes = {'title': 44, 'name': 66, 'subtitle': 34, 'body': 27, 'small': 21}
+    for key, size in sizes.items():
+        if found:
+            try:
+                fonts[key] = ImageFont.truetype(found, size); continue
+            except Exception: pass
+        fonts[key] = ImageFont.load_default()
+    return fonts
+
+
+def draw_text_with_glow(draw, text, pos, font, color, glow_color, glow_radius=4):
+    x, y = pos
+    for ddx in range(-glow_radius, glow_radius+1):
+        for ddy in range(-glow_radius, glow_radius+1):
+            dsq = ddx*ddx + ddy*ddy
+            if 0 < dsq <= glow_radius*glow_radius:
+                a = 1.0 - (dsq**0.5) / glow_radius
+                gc = tuple(int(c * a * 0.55) for c in glow_color)
+                draw.text((x+ddx, y+ddy), text, font=font, fill=gc)
+    draw.text((x, y), text, font=font, fill=color)
+
+# ---------------------------------------------------------------------------
+# Section 13: UI OVERLAY
+# ---------------------------------------------------------------------------
+
+def draw_scale_bar(draw, fonts, idx, n):
+    bx, by = 60, HEIGHT - 55
+    bw, bh = WIDTH - 120, 7
+    draw.rectangle([bx-1, by-1, bx+bw+1, by+bh+1], fill=(20, 20, 40))
+    draw.rectangle([bx, by, bx+bw, by+bh], fill=(40, 40, 70))
+    progress = idx / max(n-1, 1)
+    fw = int(bw * progress)
+    if fw > 0:
+        for px in range(fw):
+            tb = px / max(fw, 1)
+            r = int(60 + tb*80); g = int(100 + tb*80); b = int(220 + tb*35)
+            draw.line([(bx+px, by), (bx+px, by+bh)], fill=(r, g, min(b, 255)))
+    for i in range(n):
+        tx = bx + int(bw * i / max(n-1, 1))
+        col = (180, 180, 255) if i <= idx else (80, 80, 120)
+        draw.rectangle([tx-1, by-4, tx+1, by+bh+4], fill=col)
+
+
+def draw_ui_overlay(img, draw, fonts, obj, idx, n, phase, phase_t):
+    draw.rectangle([0, 0, WIDTH, 75], fill=(4, 3, 18, 180))
+    title = "SIZE COMPARISON: FROM QUARK TO OBSERVABLE UNIVERSE"
+    draw_text_with_glow(draw, title, (WIDTH//2 - 470, 15), fonts['title'], (240,240,255), (80,80,200), 3)
+    counter = f"#{idx+1:02d} / {n}"
+    draw_text_with_glow(draw, counter, (WIDTH-170, 22), fonts['subtitle'], (180,180,220), (60,60,120))
+
+    alpha = 1.0
+    if phase == 'appear': alpha = float(phase_t)
+    elif phase == 'transition': alpha = max(0.0, 1.0 - float(phase_t)*2.0)
+
+    if alpha > 0.02:
+        px = 55
+        color = obj['color']; glow = obj['glow_color']
+        cat_c = tuple(min(255, int(c*0.75)) for c in color)
+        draw_text_with_glow(draw, obj['category'], (px, HEIGHT//2-195), fonts['subtitle'], cat_c, glow, 2)
+        draw_text_with_glow(draw, obj['name'], (px, HEIGHT//2-155), fonts['name'], color, glow, 7)
+        draw_text_with_glow(draw, f"SI: {obj['si_label']}", (px, HEIGHT//2-65), fonts['body'], (210,220,255), (50,60,130))
+        draw_text_with_glow(draw, f"US: {obj['us_label']}", (px, HEIGHT//2-28), fonts['body'], (220,210,200), (70,60,50))
+        draw.line([(px, HEIGHT//2+8), (px+420, HEIGHT//2+8)], fill=(80,80,120), width=1)
+        for i, fact in enumerate(obj['facts'][:3]):
+            draw_text_with_glow(draw, f"• {fact}", (px, HEIGHT//2+22+i*38), fonts['body'], (195,200,210), (35,40,75))
+
+    draw_scale_bar(draw, fonts, idx, n)
+    draw.text((WIDTH-240, HEIGHT-28), "Generated with Python + NumPy", font=fonts['small'], fill=(60,60,90))
+
+# ---------------------------------------------------------------------------
+# Section 14: CAMERA
+# ---------------------------------------------------------------------------
+
+def get_camera_pos(obj_data, phase, phase_t):
+    bd = 3.2
+    if phase == 'appear':
+        te = ease_in_out_cubic(float(phase_t))
+        dist = bd * (1.0 + (1.0 - te) * 2.5)
+        a = float(phase_t) * 0.3
+        return np.array([np.sin(a)*dist*0.15, 0.4, dist], dtype=np.float32)
+    elif phase == 'hold':
+        a = float(phase_t) * 0.4
+        return np.array([np.sin(a)*0.5*bd, 0.3, np.cos(a)*bd], dtype=np.float32)
+    elif phase == 'transition':
+        if phase_t < 0.5:
+            te = ease_in_out_cubic(float(phase_t)*2.0)
+            dist = bd * (1.0 + te*9.0)
+            return np.array([0, 0.5, dist], dtype=np.float32)
+        else:
+            te = ease_in_out_cubic((float(phase_t)-0.5)*2.0)
+            dist = bd * (1.0 + (1.0-te)*9.0)
+            return np.array([0, 0.4, dist], dtype=np.float32)
+    return np.array([0, 0.4, bd], dtype=np.float32)
+
+# ---------------------------------------------------------------------------
+# Section 15: FRAME GENERATOR
+# ---------------------------------------------------------------------------
+
+SDF_FUNCS = [
+    sdf_quark, sdf_proton, sdf_hydrogen, sdf_dna, sdf_coronavirus,
+    sdf_rbc, sdf_ant, sdf_human, sdf_eiffel_tower, sdf_everest,
+    sdf_earth, sdf_jupiter, sdf_sun, sdf_solar_system, sdf_lightyear,
+    sdf_milkyway, sdf_local_group, sdf_observable_universe,
+]
+
+
+def generate_object_frames(obj_idx, obj_data, starfield, fonts):
+    sdf_func = SDF_FUNCS[obj_idx]
+    n_objects = len(SDF_FUNCS)
+    target = np.array([0, 0, 0], dtype=np.float32)
+    frames = []
+
+    # Appear
+    for f in range(F_APPEAR):
+        t = f / max(F_APPEAR-1, 1)
+        scale = 0.3 + 0.7 * ease_out_bounce(t)
+        cam = get_camera_pos(obj_data, 'appear', t)
+        render = render_frame(sdf_func, obj_data, cam, target, t, scale)
+        comp = blend_with_starfield(render, starfield, alpha=min(t*2, 1.0))
+        img = Image.fromarray(comp); draw = ImageDraw.Draw(img)
+        draw_ui_overlay(img, draw, fonts, obj_data, obj_idx, n_objects, 'appear', t)
+        frames.append(np.array(img))
+
+    # Hold
+    for f in range(F_HOLD):
+        t = f / max(F_HOLD-1, 1)
+        cam = get_camera_pos(obj_data, 'hold', t)
+        render = render_frame(sdf_func, obj_data, cam, target, t, 1.0)
+        comp = blend_with_starfield(render, starfield, alpha=1.0)
+        img = Image.fromarray(comp); draw = ImageDraw.Draw(img)
+        draw_ui_overlay(img, draw, fonts, obj_data, obj_idx, n_objects, 'hold', t)
+        frames.append(np.array(img))
+
+    # Transition
+    for f in range(F_TRANSITION):
+        t = f / max(F_TRANSITION-1, 1)
+        cam = get_camera_pos(obj_data, 'transition', t)
+        if t < 0.5:
+            render = render_frame(sdf_func, obj_data, cam, target, t, 1.0)
+            bg_a = 1.0 - t*1.4
+        else:
+            render = np.zeros((RENDER_H, RENDER_W, 3), dtype=np.uint8)
+            bg_a = 0.15 + (t-0.5)*1.7
+        comp = blend_with_starfield(render, starfield, alpha=max(0.05, bg_a))
+        img = Image.fromarray(comp); draw = ImageDraw.Draw(img)
+        draw_ui_overlay(img, draw, fonts, obj_data, obj_idx, n_objects, 'transition', t)
+        frames.append(np.array(img))
+
+    return frames
+
+# ---------------------------------------------------------------------------
+# Section 16: MAIN
+# ---------------------------------------------------------------------------
+
+def main():
+    n_obj = len(OBJECTS)
+    total_frames = n_obj * F_PER_OBJ
+    duration = total_frames * _FRAME_REPEAT / FPS_OUTPUT
+
+    print("=" * 60)
+    print("  SIZE COMPARISON: FROM QUARK TO OBSERVABLE UNIVERSE")
+    print("  *** FAST VERSION — renders at 480×270, upscales to 1080p ***")
+    print("=" * 60)
+    print(f"Resolution : {RENDER_W}×{RENDER_H} render → {WIDTH}×{HEIGHT} output")
+    print(f"FPS        : {FPS_RENDER} render → {FPS_OUTPUT} output ({_FRAME_REPEAT}× duplication)")
+    print(f"Objects    : {n_obj}")
+    print(f"Est frames : {total_frames} rendered → {total_frames * _FRAME_REPEAT} output")
+    print(f"Est duration: {duration:.0f}s ({duration/60:.1f} min)")
+    print()
+
+    print("[1/3] Generating starfield background...")
+    starfield = generate_starfield()
+
+    print("[2/3] Loading fonts...")
+    fonts = load_fonts()
+
+    print(f"[3/3] Rendering {n_obj} objects...")
+
+    output_file = "size_comparison_3d.mp4"
+    writer = imageio.get_writer(output_file, fps=FPS_OUTPUT, codec='libx264',
+                                quality=8, macro_block_size=1)
+
+    total_written = 0
+    for i, obj in enumerate(tqdm(OBJECTS, desc="Objects", unit="obj")):
+        tqdm.write(f"  -> [{i+1:02d}/{n_obj}] {obj['name']}")
+        frames = generate_object_frames(i, obj, starfield, fonts)
+        for frame in frames:
+            for _ in range(_FRAME_REPEAT):
+                writer.append_data(frame)
+            total_written += 1
+        del frames
+        gc.collect()
+
+    writer.close()
+
+    print("\n" + "=" * 60)
+    print("GENERATION COMPLETE")
+    print("=" * 60)
+    print(f"Output file : {output_file}")
+    if os.path.exists(output_file):
+        print(f"File size   : {os.path.getsize(output_file)/1024/1024:.1f} MB")
+    out_frames = total_written * _FRAME_REPEAT
+    print(f"Frames      : {total_written} rendered → {out_frames} output at {FPS_OUTPUT} fps")
+    print(f"Duration    : {out_frames/FPS_OUTPUT:.1f}s  ({out_frames/FPS_OUTPUT/60:.1f} min)")
+    print(f"Objects     : {n_obj}")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
